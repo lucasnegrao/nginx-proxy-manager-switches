@@ -90,11 +90,14 @@ class NpmProxyBinarySwitch(NpmSwitchesEntity, SwitchEntity):
     @property
     def extra_state_attributes(self):
         """Return device state attributes."""
+        scheme = self.host["forward_scheme"]          # "http" or "https"
+        domain = self.host["domain_names"][0]         # first item in the array
         return {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
             "forward_host": self.host["forward_host"],
-            "online": self.host["meta"]["nginx_online"],
+            "nginx_online": self.host["meta"]["nginx_online"],
+            "url": f"{scheme}://{domain}/"
         }
 
 class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
@@ -145,7 +148,7 @@ class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         return {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
-            "forward_host": self.host["forward_domain_name"],
+            "forward_host": self.host["forward_domain_name"].split(":")[0],
             # "forward_domain_name": self.host["forward_domain_names"],
         }
 
