@@ -93,6 +93,7 @@ class NpmProxyBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         return {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
+            "forward_host": self.host["forward_host"],
         }
 
 class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
@@ -143,6 +144,7 @@ class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         return {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
+            "forward_host": self.host["forward_host"],
             # "forward_domain_name": self.host["forward_domain_names"],
         }
 
