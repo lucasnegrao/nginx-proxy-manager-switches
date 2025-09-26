@@ -11,7 +11,6 @@ from .const import (
     CONF_PASSWORD,
     CONF_USERNAME,
     DOMAIN,
-    PLATFORMS,
     CONF_INDLUDE_PROXY,
     CONF_INCLUDE_REDIR,
     CONF_INCLUDE_STREAMS,
@@ -25,6 +24,9 @@ from .const import (
     DEFAULT_INCLUDE_STREAMS,
     DEFAULT_INCLUDE_DEAD,
     DEFAULT_INCLUDE_SENSORS,
+    # New imports for reachability interval
+    CONF_REACHABILITY_INTERVAL_MINUTES,
+    DEFAULT_REACHABILITY_INTERVAL_MINUTES,
 )
 
 
@@ -48,13 +50,11 @@ class NPMSwitchesFloHandler(config_entries.ConfigFlow, domain=DOMAIN):
         #     return self.async_abort(reason="single_instance_allowed")
 
         if user_input is not None:
-            scheme_end = user_input[CONF_NPM_URL].find("://")+3
+            scheme_end = user_input[CONF_NPM_URL].find("://") + 3
             self.clean_npm_url = user_input[CONF_NPM_URL][scheme_end:]
             user_input["clean_npm_url"] = slugify(f"{self.clean_npm_url}")
 
-            # existing_entry = self._async_entry_for_username(user_input[CONF_NPM_URL])
             existing_entry = self._async_entry_for_username(self.clean_npm_url)
-            # if existing_entry and not self.reauth:
             if existing_entry:
                 return self.async_abort(reason="already_configured")
 
@@ -64,27 +64,21 @@ class NPMSwitchesFloHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 user_input[CONF_NPM_URL],
             )
             if valid:
+                # Store initial values (including reachability interval) in data
                 return self.async_create_entry(
                     title=self.clean_npm_url, data=user_input
                 )
             else:
                 self._errors["base"] = "auth"
 
-            return await self._show_config_form(user_input)
-
-        # user_input = {}
-        # # Provide defaults for form
-        # user_input[CONF_USERNAME] = ""
-        # user_input[CONF_PASSWORD] = ""
-        # user_input[CONF_NPM_URL] = "http://"
-        # user_input[CONF_INDLUDE_PROXY] = True
+            return await self._show_config_form()
 
         return await self._show_config_form()
 
-    # @staticmethod
-    # @callback
-    # def async_get_options_flow(config_entry):
-    #     return BlueprintOptionsFlowHandler(config_entry)
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return NPMSwitchesOptionsFlowHandler(config_entry)
 
     async def _show_config_form(self):  # pylint: disable=unused-argument
         """Show the configuration form to edit location data."""
@@ -95,11 +89,16 @@ class NPMSwitchesFloHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
                     vol.Required(CONF_PASSWORD, default=DEFAULT_PASSWORD): str,
                     vol.Required(CONF_NPM_URL, default=DEFAULT_NPM_URL): str,
-                    vol.Optional(CONF_INCLUDE_SENSORS,default=DEFAULT_INCLUDE_SENSORS): bool,
-                    vol.Optional(CONF_INDLUDE_PROXY,default=DEFAULT_INDLUDE_PROXY): bool,
-                    vol.Optional(CONF_INCLUDE_REDIR,default=DEFAULT_INCLUDE_REDIR): bool,
-                    vol.Optional(CONF_INCLUDE_STREAMS,default=DEFAULT_INCLUDE_STREAMS): bool,
-                    vol.Optional(CONF_INCLUDE_DEAD,default=DEFAULT_INCLUDE_DEAD): bool
+                    vol.Optional(CONF_INCLUDE_SENSORS, default=DEFAULT_INCLUDE_SENSORS): bool,
+                    vol.Optional(CONF_INDLUDE_PROXY, default=DEFAULT_INDLUDE_PROXY): bool,
+                    vol.Optional(CONF_INCLUDE_REDIR, default=DEFAULT_INCLUDE_REDIR): bool,
+                    vol.Optional(CONF_INCLUDE_STREAMS, default=DEFAULT_INCLUDE_STREAMS): bool,
+                    vol.Optional(CONF_INCLUDE_DEAD, default=DEFAULT_INCLUDE_DEAD): bool,
+                    # New: reachability interval (minutes)
+                    vol.Optional(
+                        CONF_REACHABILITY_INTERVAL_MINUTES,
+                        default=DEFAULT_REACHABILITY_INTERVAL_MINUTES,
+                    ): vol.All(int, vol.Range(min=0, max=1440)),
                 }
             ),
             errors=self._errors,
@@ -120,65 +119,45 @@ class NPMSwitchesFloHandler(config_entries.ConfigFlow, domain=DOMAIN):
     def _async_entry_for_username(self, username):
         """Find an existing entry for a username."""
         for entry in self._async_current_entries():
-            # if entry.data.get(CONF_NPM_URL) == username:
             if entry.title == username:
                 return entry
         return None
 
 
-# class BlueprintOptionsFlowHandler(config_entries.OptionsFlow):
-#     """Blueprint config flow options handler."""
+class NPMSwitchesOptionsFlowHandler(config_entries.OptionsFlow):
+    """Options flow handler to change settings after setup."""
 
-#     def __init__(self, config_entry):
-#         """Initialize HACS options flow."""
-#         self.config_entry = config_entry
-#         self.options = dict(config_entry.options)
+    def __init__(self, config_entry):
+        """Initialize options flow."""
+        self.config_entry = config_entry
+        self.options = dict(config_entry.options)
 
-#     async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
-#         """Manage the options."""
-#         return await self.async_step_user()
+    async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
+        """Manage the options."""
+        return await self.async_step_user()
 
-#     async def async_step_user(self, user_input=None):
-#         """Handle a flow initialized by the user."""
-#         if user_input is not None:
-#             self.options.update(user_input)
-#             return await self._update_options()
+    async def async_step_user(self, user_input=None):
+        """Handle a flow initialized by the user."""
+        if user_input is not None:
+            self.options.update(user_input)
+            return self.async_create_entry(title="", data=self.options)
 
-#         return self.async_show_form(
-#             step_id="user",
-#             data_schema = vol.Schema(
-#                 {
-#                     vol.Optional(CONF_INDLUDE_PROXY,default=self.config_entry.options.get(CONF_INDLUDE_PROXY, DEFAULT_INDLUDE_PROXY),): bool,
-#                     vol.Optional(
-#                         CONF_INCLUDE_REDIR,
-#                         default=self.config_entry.options.get(
-#                             CONF_INCLUDE_REDIR, DEFAULT_INCLUDE_REDIR
-#                         ),
-#                     ): bool,
-#                     vol.Optional(
-#                         CONF_INCLUDE_STREAMS,
-#                         default=self.config_entry.options.get(
-#                             CONF_INCLUDE_STREAMS, DEFAULT_INCLUDE_STREAMS
-#                         ),
-#                     ): bool,
-#                     vol.Optional(
-#                         CONF_INCLUDE_DEAD,
-#                         default=self.config_entry.options.get(
-#                             CONF_INCLUDE_DEAD, DEFAULT_INCLUDE_DEAD
-#                         ),
-#                     ): bool,
-#                     vol.Optional(
-#                         CONF_INCLUDE_SENSORS,
-#                         default=self.config_entry.options.get(
-#                             CONF_INCLUDE_SENSORS, DEFAULT_INCLUDE_SENSORS
-#                         ),
-#                     ): bool,
-#                 }
-#             )
-#         )
+        # Derive default from options -> data -> constant
+        default_interval = self.config_entry.options.get(
+            CONF_REACHABILITY_INTERVAL_MINUTES,
+            self.config_entry.data.get(
+                CONF_REACHABILITY_INTERVAL_MINUTES, DEFAULT_REACHABILITY_INTERVAL_MINUTES
+            ),
+        )
 
-#     async def _update_options(self):
-#         """Update config entry options."""
-#         return self.async_create_entry(
-#             title=self.config_entry.data.get(CONF_USERNAME), data=self.options
-#         )
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_REACHABILITY_INTERVAL_MINUTES,
+                        default=default_interval,
+                    ): vol.All(int, vol.Range(min=0, max=1440)),
+                }
+            ),
+        )
