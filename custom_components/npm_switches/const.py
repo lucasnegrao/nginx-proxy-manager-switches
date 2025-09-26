@@ -19,7 +19,6 @@ SENSOR = "sensor"
 SWITCH = "switch"
 PLATFORMS = [SENSOR, SWITCH]
 
-
 # Configuration and options
 CONF_ENABLED = "enabled"
 CONF_USERNAME = "username"
@@ -30,6 +29,10 @@ CONF_INCLUDE_REDIR = "include_redirection_hosts"
 CONF_INCLUDE_STREAMS = "include_stream_hosts"
 CONF_INCLUDE_DEAD = "include_dead_hosts"
 CONF_INCLUDE_SENSORS = "include_enable_disable_count_sensors"
+
+# New: reachability interval (in minutes)
+CONF_REACHABILITY_INTERVAL_MINUTES = "reachability_interval_minutes"
+
 DEFAULT_ENABLED = ""
 DEFAULT_USERNAME = ""
 DEFAULT_PASSWORD = ""
@@ -40,9 +43,11 @@ DEFAULT_INCLUDE_STREAMS = False
 DEFAULT_INCLUDE_DEAD = False
 DEFAULT_INCLUDE_SENSORS = True
 
+# New default for reachability interval
+DEFAULT_REACHABILITY_INTERVAL_MINUTES = 5  # minutes; 0 disables periodic checks
+
 # Defaults
 DEFAULT_NAME = DOMAIN
-
 
 STARTUP_MESSAGE = f"""
 -------------------------------------------------------------------
