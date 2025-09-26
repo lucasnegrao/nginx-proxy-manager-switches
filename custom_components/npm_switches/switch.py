@@ -10,7 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    # New imports for reachability config
+    CONF_REACHABILITY_INTERVAL_MINUTES,
+    DEFAULT_REACHABILITY_INTERVAL_MINUTES,
+)
 from .entity import NpmSwitchesEntity
 from . import NpmSwitchesUpdateCoordinator
 
@@ -45,9 +50,21 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 class _ReachabilityMixin:
     """Common helpers to manage reachability checks and attributes."""
-    _reachability_interval = timedelta(minutes=5)
 
     def _init_reachability_state(self):
+        # Load interval from options -> data -> default (minutes)
+        minutes = self.config_entry.options.get(
+            CONF_REACHABILITY_INTERVAL_MINUTES,
+            self.config_entry.data.get(
+                CONF_REACHABILITY_INTERVAL_MINUTES, DEFAULT_REACHABILITY_INTERVAL_MINUTES
+            ),
+        )
+        try:
+            minutes = int(minutes)
+        except Exception:  # noqa: BLE001
+            minutes = DEFAULT_REACHABILITY_INTERVAL_MINUTES
+
+        self._reachability_interval = timedelta(minutes=max(0, minutes))
         self._reachable: bool | None = None
         self._last_reachability_check: datetime | None = None
         self._http_status: int | None = None
@@ -56,14 +73,15 @@ class _ReachabilityMixin:
     async def async_added_to_hass(self):
         await super().async_added_to_hass()
 
-        # Re-check reachability every interval
         def _periodic(_now):
             self.hass.async_create_task(self._update_reachability())
 
-        self._unsub_reachability_timer = async_track_time_interval(
-            self.hass, _periodic, self._reachability_interval
-        )
-        self.async_on_remove(self._unsub_reachability_timer)
+        # Register periodic reachability if interval > 0
+        if self._reachability_interval.total_seconds() > 0:
+            self._unsub_reachability_timer = async_track_time_interval(
+                self.hass, _periodic, self._reachability_interval
+            )
+            self.async_on_remove(self._unsub_reachability_timer)
 
         # Also re-check when coordinator updates (NPM state changed)
         self.async_on_remove(
@@ -71,6 +89,45 @@ class _ReachabilityMixin:
                 lambda: self.hass.async_create_task(self._update_reachability())
             )
         )
+
+        # Listen for option changes and reconfigure the timer dynamically
+        async def _on_entry_update(hass, entry: ConfigEntry):
+            new_minutes = entry.options.get(
+                CONF_REACHABILITY_INTERVAL_MINUTES,
+                entry.data.get(
+                    CONF_REACHABILITY_INTERVAL_MINUTES,
+                    DEFAULT_REACHABILITY_INTERVAL_MINUTES,
+                ),
+            )
+            try:
+                new_minutes = int(new_minutes)
+            except Exception:  # noqa: BLE001
+                new_minutes = DEFAULT_REACHABILITY_INTERVAL_MINUTES
+
+            new_interval = timedelta(minutes=max(0, new_minutes))
+            if new_interval != self._reachability_interval:
+                # Cancel existing timer
+                if self._unsub_reachability_timer:
+                    try:
+                        self._unsub_reachability_timer()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._unsub_reachability_timer = None
+
+                self._reachability_interval = new_interval
+
+                # Re-register if enabled
+                if self._reachability_interval.total_seconds() > 0:
+                    self._unsub_reachability_timer = async_track_time_interval(
+                        self.hass, _periodic, self._reachability_interval
+                    )
+                    self.async_on_remove(self._unsub_reachability_timer)
+
+                # Trigger an immediate check to update attributes
+                self.hass.async_create_task(self._update_reachability())
+
+        remove_update_listener = self.config_entry.add_update_listener(_on_entry_update)
+        self.async_on_remove(remove_update_listener)
 
         # Initial check
         self.hass.async_create_task(self._update_reachability())
