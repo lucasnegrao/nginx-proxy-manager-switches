@@ -1,10 +1,14 @@
 """Switch platform for npm_switches."""
+import asyncio
+from datetime import datetime, timedelta
 import logging
+
+import aiohttp
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.util import slugify
-
-# from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN
 from .entity import NpmSwitchesEntity
@@ -16,31 +20,79 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass, entry, async_add_entities):
     """Setup sensor platform."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    api = hass.data[DOMAIN][entry.entry_id].api
+    api = coordinator.api
     proxy_hosts = await api.get_proxy_hosts()
     redir_hosts = await api.get_redirection_hosts()
     stream_hosts = await api.get_stream_hosts()
     dead_hosts = await api.get_dead_hosts()
     entities = []
 
-    if entry.data["include_proxy_hosts"]:
+    if entry.data.get("include_proxy_hosts"):
         for proxy_host in proxy_hosts.values():
             entities.append(NpmProxyBinarySwitch(coordinator, entry, proxy_host))
-    if entry.data["include_redirection_hosts"]:
+    if entry.data.get("include_redirection_hosts"):
         for redir_host in redir_hosts.values():
             entities.append(NpmRedirBinarySwitch(coordinator, entry, redir_host))
-    if entry.data["include_stream_hosts"]:
+    if entry.data.get("include_stream_hosts"):
         for stream_host in stream_hosts.values():
             entities.append(NpmStreamBinarySwitch(coordinator, entry, stream_host))
-    if entry.data["include_dead_hosts"]:
+    if entry.data.get("include_dead_hosts"):
         for dead_host in dead_hosts.values():
             entities.append(NpmDeadBinarySwitch(coordinator, entry, dead_host))
 
     async_add_entities(entities, True)
-    # async_add_devices([NpmProxyBinarySwitch(coordinator, entry, "20")])
 
 
-class NpmProxyBinarySwitch(NpmSwitchesEntity, SwitchEntity):
+class _ReachabilityMixin:
+    """Common helpers to manage reachability checks and attributes."""
+    _reachability_interval = timedelta(minutes=5)
+
+    def _init_reachability_state(self):
+        self._reachable: bool | None = None
+        self._last_reachability_check: datetime | None = None
+        self._http_status: int | None = None
+        self._unsub_reachability_timer = None
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+
+        # Re-check reachability every interval
+        def _periodic(_now):
+            self.hass.async_create_task(self._update_reachability())
+
+        self._unsub_reachability_timer = async_track_time_interval(
+            self.hass, _periodic, self._reachability_interval
+        )
+        self.async_on_remove(self._unsub_reachability_timer)
+
+        # Also re-check when coordinator updates (NPM state changed)
+        self.async_on_remove(
+            self.coordinator.async_add_listener(
+                lambda: self.hass.async_create_task(self._update_reachability())
+            )
+        )
+
+        # Initial check
+        self.hass.async_create_task(self._update_reachability())
+
+    def _attrs_with_reachability(self, base: dict) -> dict:
+        base.update(
+            {
+                "reachable": self._reachable,
+                "last_reachability_check": (
+                    self._last_reachability_check.isoformat()
+                    if self._last_reachability_check
+                    else None
+                ),
+            }
+        )
+        # Only include http_status for HTTP-based checks
+        if hasattr(self, "_http_status"):
+            base["http_status"] = self._http_status
+        return base
+
+
+class NpmProxyBinarySwitch(_ReachabilityMixin, NpmSwitchesEntity, SwitchEntity):
     """Switches to enable/disable the Proxy Host Type in NPM"""
 
     def __init__(
@@ -53,27 +105,25 @@ class NpmProxyBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         super().__init__(coordinator, entry)
         self.host = host
         self.name = "Proxy " + self.host["domain_names"][0].replace(".", " ").capitalize()
-        self.entity_id = "switch."+slugify(f"{entry.title} {self.name}")
+        self.entity_id = "switch." + slugify(f"{entry.title} {self.name}")
         self._attr_unique_id = f"{entry.entry_id} {self.name}"
         self.host_id = str(host["id"])
         self.host_type = "proxy-hosts"
+        self._init_reachability_state()
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on the switch."""
         await self.coordinator.api.enable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
         """Turn off the switch."""
         await self.coordinator.api.disable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
-
-    # @property
-    # def name(self):
-    #     """Return the name of the switch."""
-    #     return "NPM " + self.host["domain_names"][0].replace(".", " ").capitalize()
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     @property
     def icon(self):
@@ -90,17 +140,43 @@ class NpmProxyBinarySwitch(NpmSwitchesEntity, SwitchEntity):
     @property
     def extra_state_attributes(self):
         """Return device state attributes."""
-        scheme = self.host["forward_scheme"]          # "http" or "https"
-        domain = self.host["domain_names"][0]         # first item in the array
-        return {
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        base = {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
             "forward_host": self.host["forward_host"],
             "nginx_online": self.host["meta"]["nginx_online"],
-            "url": f"{scheme}://{domain}/"
+            "url": f"{scheme}://{domain}/",
         }
+        return self._attrs_with_reachability(base)
 
-class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
+    async def _update_reachability(self):
+        """Probe the public URL to determine reachability."""
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        url = f"{scheme}://{domain}/"
+        session = async_get_clientsession(self.hass)
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with session.get(url, allow_redirects=True, timeout=timeout) as resp:
+                self._http_status = resp.status
+                # Consider < 500 as reachable (even 401/403/404 means server responded)
+                self._reachable = resp.status < 500
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self._reachable = False
+            self._http_status = None
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Unexpected error probing %s: %s", url, err)
+            self._reachable = False
+            self._http_status = None
+        finally:
+            self._last_reachability_check = datetime.utcnow()
+            self.async_write_ha_state()
+
+
+class NpmRedirBinarySwitch(_ReachabilityMixin, NpmSwitchesEntity, SwitchEntity):
     """Switches to enable/disable the Redir Host Type in NPM"""
 
     def __init__(
@@ -113,22 +189,25 @@ class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         super().__init__(coordinator, entry)
         self.host = host
         self.name = "Redirect " + self.host["domain_names"][0].replace(".", " ").capitalize()
-        self.entity_id = "switch."+slugify(f"{entry.title} {self.name}")
+        self.entity_id = "switch." + slugify(f"{entry.title} {self.name}")
         self._attr_unique_id = f"{entry.entry_id} {self.name}"
         self.host_type = "redirection-hosts"
         self.host_id = str(host["id"])
+        self._init_reachability_state()
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on the switch."""
         await self.coordinator.api.enable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
         """Turn off the switch."""
         await self.coordinator.api.disable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     @property
     def icon(self):
@@ -145,19 +224,43 @@ class NpmRedirBinarySwitch(NpmSwitchesEntity, SwitchEntity):
     @property
     def extra_state_attributes(self):
         """Return device state attributes."""
-        scheme = self.host["forward_scheme"]          # "http" or "https"
-        domain = self.host["domain_names"][0]         # first item in the array
-        return {
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        base = {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
             "forward_host": self.host["forward_domain_name"].split(":")[0],
             "nginx_online": self.host["meta"]["nginx_online"],
-            "url": f"{scheme}://{domain}/"
-            # "forward_domain_name": self.host["forward_domain_names"],
+            "url": f"{scheme}://{domain}/",
         }
+        return self._attrs_with_reachability(base)
 
-class NpmStreamBinarySwitch(NpmSwitchesEntity, SwitchEntity):
-    """Switches to enable/disable the Redir Host Type in NPM"""
+    async def _update_reachability(self):
+        """Probe the public URL to determine reachability."""
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        url = f"{scheme}://{domain}/"
+        session = async_get_clientsession(self.hass)
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with session.get(url, allow_redirects=True, timeout=timeout) as resp:
+                self._http_status = resp.status
+                self._reachable = resp.status < 500
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self._reachable = False
+            self._http_status = None
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Unexpected error probing %s: %s", url, err)
+            self._reachable = False
+            self._http_status = None
+        finally:
+            self._last_reachability_check = datetime.utcnow()
+            self.async_write_ha_state()
+
+
+class NpmStreamBinarySwitch(_ReachabilityMixin, NpmSwitchesEntity, SwitchEntity):
+    """Switches to enable/disable the Stream Host Type in NPM"""
 
     def __init__(
         self,
@@ -165,26 +268,29 @@ class NpmStreamBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         entry: ConfigEntry,
         host: dict,
     ) -> None:
-        """Initialize steam switch entity."""
+        """Initialize stream switch entity."""
         super().__init__(coordinator, entry)
         self.host = host
         self.name = "Stream " + str(self.host["incoming_port"])
-        self.entity_id = "switch."+slugify(f"{entry.title} {self.name}")
+        self.entity_id = "switch." + slugify(f"{entry.title} {self.name}")
         self._attr_unique_id = f"{entry.entry_id} {self.name}"
         self.host_type = "streams"
         self.host_id = str(host["id"])
+        self._init_reachability_state()
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on the switch."""
         await self.coordinator.api.enable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
         """Turn off the switch."""
         await self.coordinator.api.disable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     @property
     def icon(self):
@@ -201,14 +307,31 @@ class NpmStreamBinarySwitch(NpmSwitchesEntity, SwitchEntity):
     @property
     def extra_state_attributes(self):
         """Return device state attributes."""
-        return {
+        base = {
             "id": self.host["id"],
             "forwarding_host": self.host["forwarding_host"],
             "forwarding_port": self.host["forwarding_port"],
-            # "forward_domain_name": self.host["forward_domain_names"],
         }
+        return self._attrs_with_reachability(base)
 
-class NpmDeadBinarySwitch(NpmSwitchesEntity, SwitchEntity):
+    async def _update_reachability(self):
+        """TCP connect to the upstream target to determine reachability."""
+        host = self.host["forwarding_host"]
+        port = int(self.host["forwarding_port"])
+        try:
+            await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3)
+            self._reachable = True
+        except (OSError, asyncio.TimeoutError):
+            self._reachable = False
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Unexpected error probing TCP %s:%s: %s", host, port, err)
+            self._reachable = False
+        finally:
+            self._last_reachability_check = datetime.utcnow()
+            self.async_write_ha_state()
+
+
+class NpmDeadBinarySwitch(_ReachabilityMixin, NpmSwitchesEntity, SwitchEntity):
     """Switches to enable/disable the Dead Host Type in NPM"""
 
     def __init__(
@@ -217,26 +340,29 @@ class NpmDeadBinarySwitch(NpmSwitchesEntity, SwitchEntity):
         entry: ConfigEntry,
         host: dict,
     ) -> None:
-        """Initialize redir switch entity."""
+        """Initialize dead-host switch entity."""
         super().__init__(coordinator, entry)
         self.host = host
         self.name = "404 " + self.host["domain_names"][0].replace(".", " ").capitalize()
-        self.entity_id = "switch."+slugify(f"{entry.title} {self.name}")
+        self.entity_id = "switch." + slugify(f"{entry.title} {self.name}")
         self._attr_unique_id = f"{entry.entry_id} {self.name}"
         self.host_type = "dead-hosts"
         self.host_id = str(host["id"])
+        self._init_reachability_state()
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on the switch."""
         await self.coordinator.api.enable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
         """Turn off the switch."""
         await self.coordinator.api.disable_host(self.host_id, self.host_type)
-        self.async_write_ha_state()
         self.host = await self.coordinator.api.get_host(self.host_id, self.host_type)
+        await self._update_reachability()
+        self.async_write_ha_state()
 
     @property
     def icon(self):
@@ -253,8 +379,35 @@ class NpmDeadBinarySwitch(NpmSwitchesEntity, SwitchEntity):
     @property
     def extra_state_attributes(self):
         """Return device state attributes."""
-        return {
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        base = {
             "id": self.host["id"],
             "domain_names": self.host["domain_names"],
-            # "forward_domain_name": self.host["forward_domain_names"],
+            "url": f"{scheme}://{domain}/",
         }
+        return self._attrs_with_reachability(base)
+
+    async def _update_reachability(self):
+        """Probe the public URL (should return 404, but server must be reachable)."""
+        scheme = self.host.get("forward_scheme", "http")
+        domain = self.host["domain_names"][0]
+        url = f"{scheme}://{domain}/"
+        session = async_get_clientsession(self.hass)
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with session.get(url, allow_redirects=True, timeout=timeout) as resp:
+                self._http_status = resp.status
+                # "Dead host" should respond (often 404). Treat any response as reachable.
+                self._reachable = True
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self._reachable = False
+            self._http_status = None
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Unexpected error probing %s: %s", url, err)
+            self._reachable = False
+            self._http_status = None
+        finally:
+            self._last_reachability_check = datetime.utcnow()
+            self.async_write_ha_state()
